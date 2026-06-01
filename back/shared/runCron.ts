@@ -1,8 +1,10 @@
 import { spawn } from 'cross-spawn';
+import dayjs from 'dayjs';
 import taskLimit from './pLimit';
 import Logger from '../loaders/logger';
 import { ICron } from '../protos/cron';
 import { CrontabModel, CrontabStatus } from '../data/cron';
+import { CrontabStatModel } from '../data/cronStats';
 import { killTask } from '../config/util';
 
 export function runCron(cmd: string, cron: ICron): Promise<number | void> {
@@ -47,6 +49,7 @@ export function runCron(cmd: string, cron: ICron): Promise<number | void> {
           command: cmd,
         })}`,
       );
+      const startTime = Date.now();
       const cp = spawn(cmd, { shell: '/bin/bash' });
 
       cp.stderr.on('data', (data) => {
@@ -65,6 +68,7 @@ export function runCron(cmd: string, cron: ICron): Promise<number | void> {
       });
 
       cp.on('exit', async (code) => {
+        const elapsed = Date.now() - startTime;
         taskLimit.removeQueuedCron(cron.id);
         Logger.info(
           '[schedule][执行任务结束] 参数: %s, 退出码: %j',
@@ -74,6 +78,44 @@ export function runCron(cmd: string, cron: ICron): Promise<number | void> {
           }),
           code,
         );
+
+        // 写入统计
+        try {
+          const today = dayjs().format('YYYY-MM-DD');
+          const isSuccess = code === 0 ? 1 : 0;
+          const isFail = code !== 0 ? 1 : 0;
+          const refId = Number(cron.id);
+
+          const existing = await CrontabStatModel.findOne({
+            where: { ref_id: refId, date: today },
+          });
+
+          if (existing) {
+            await CrontabStatModel.update(
+              {
+                run_count: (existing.run_count || 0) + 1,
+                success_count: (existing.success_count || 0) + isSuccess,
+                fail_count: (existing.fail_count || 0) + isFail,
+                total_time: (existing.total_time || 0) + elapsed,
+                max_time: Math.max(existing.max_time || 0, elapsed),
+              },
+              { where: { id: existing.id } },
+            );
+          } else {
+            await CrontabStatModel.create({
+              ref_id: refId,
+              date: today,
+              run_count: 1,
+              success_count: isSuccess,
+              fail_count: isFail,
+              total_time: elapsed,
+              max_time: elapsed,
+            });
+          }
+        } catch (err) {
+          Logger.error('[schedule][统计写入失败]', err);
+        }
+
         resolve({ ...cron, command: cmd, pid: cp.pid, code });
       });
     });
